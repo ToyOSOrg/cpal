@@ -75,6 +75,8 @@ pub(crate) mod wasapi;
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 pub(crate) mod webaudio;
 
+#[cfg(target_os = "toyos")]
+pub(crate) mod toyos;
 #[cfg(feature = "custom")]
 pub(crate) mod custom;
 
@@ -86,6 +88,7 @@ pub(crate) mod custom;
     target_os = "netbsd",
     target_vendor = "apple",
     target_os = "android",
+    target_os = "toyos",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 pub(crate) mod null;

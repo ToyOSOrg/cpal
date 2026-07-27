@@ -928,6 +928,23 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "toyos")]
+mod platform_impl {
+    pub use crate::host::toyos::Host as ToyosHost;
+
+    impl_platform_host!(
+        Toyos => ToyosHost,
+        #[cfg(feature = "custom")] Custom => super::CustomHost,
+    );
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        ToyosHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(not(any(
     windows,
     target_os = "linux",
@@ -936,6 +953,7 @@ mod platform_impl {
     target_os = "netbsd",
     target_vendor = "apple",
     target_os = "android",
+    target_os = "toyos",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 mod platform_impl {

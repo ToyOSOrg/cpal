@@ -189,6 +189,10 @@ web-sys = { version = "0.3", features = [
     "AudioContextState",
 ] }
 
+[target.'cfg(target_os = "toyos")'.dependencies]
+toyos-abi = { path = "../../toyos-abi" }
+toyos = { path = "../../toyos" }
+
 [target.'cfg(target_os = "android")'.dependencies]
 audio_thread_priority = { version = "0.35", optional = true, default-features = false }
 ndk = { version = "0.9", default-features = false, features = [
