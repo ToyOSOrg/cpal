@@ -1,17 +1,17 @@
+use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
-    BufferSize, BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription,
-    DeviceDescriptionBuilder, DeviceId, DeviceIdError, DeviceNameError, DevicesError,
-    InputCallbackInfo, OutputCallbackInfo, OutputStreamTimestamp, PauseStreamError,
-    PlayStreamError, SampleFormat, SampleRate, StreamConfig, StreamError, StreamInstant,
-    SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
-    SupportedStreamConfigsError,
+    BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error, ErrorKind,
+    FrameCount, InputCallbackInfo, OutputCallbackInfo, OutputStreamTimestamp, SampleFormat,
+    SampleRate, StreamConfig, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
+    SupportedStreamConfigRange,
 };
 
+const DEVICE_NAME: &str = "ToyOS Audio";
 const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
 // soundd's fixed device period — the only buffer size a stream can get, so
@@ -28,6 +28,12 @@ pub struct Host;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Device;
 
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(DEVICE_NAME)
+    }
+}
+
 pub struct Stream {
     state: Arc<AtomicU32>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -41,13 +47,13 @@ crate::assert_stream_sync!(Stream);
 pub type SupportedInputConfigs = crate::iter::SupportedInputConfigs;
 pub type SupportedOutputConfigs = crate::iter::SupportedOutputConfigs;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Devices {
     yielded: bool,
 }
 
 impl Host {
-    pub fn new() -> Result<Self, crate::HostUnavailable> {
+    pub fn new() -> Result<Self, Error> {
         Ok(Host)
     }
 }
@@ -60,7 +66,7 @@ impl HostTrait for Host {
         true
     }
 
-    fn devices(&self) -> Result<Self::Devices, DevicesError> {
+    fn devices(&self) -> Result<Self::Devices, Error> {
         Ok(Devices { yielded: false })
     }
 
@@ -78,27 +84,19 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    fn name(&self) -> Result<String, DeviceNameError> {
-        Ok("ToyOS Audio".to_string())
+    fn description(&self) -> Result<DeviceDescription, Error> {
+        Ok(DeviceDescriptionBuilder::new(DEVICE_NAME).build())
     }
 
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
-        Ok(DeviceDescriptionBuilder::new("ToyOS Audio".to_string()).build())
+    fn id(&self) -> Result<DeviceId, Error> {
+        Ok(DeviceId::new(crate::platform::HostId::Toyos, ""))
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
-        Ok(DeviceId(crate::platform::HostId::Toyos, String::new()))
-    }
-
-    fn supported_input_configs(
-        &self,
-    ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
         Ok(Vec::new().into_iter())
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
         Ok(vec![SupportedStreamConfigRange::new(
             CHANNELS,
             SAMPLE_RATE,
@@ -112,11 +110,11 @@ impl DeviceTrait for Device {
         .into_iter())
     }
 
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        Err(DefaultStreamConfigError::StreamTypeNotSupported)
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
+        Err(Error::new(ErrorKind::UnsupportedOperation))
     }
 
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         Ok(SupportedStreamConfig::new(
             CHANNELS,
             SAMPLE_RATE,
@@ -135,12 +133,12 @@ impl DeviceTrait for Device {
         _data_callback: D,
         _error_callback: E,
         _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
-        Err(BuildStreamError::StreamConfigNotSupported)
+        Err(Error::new(ErrorKind::UnsupportedOperation))
     }
 
     fn build_output_stream_raw<D, E>(
@@ -150,10 +148,10 @@ impl DeviceTrait for Device {
         mut data_callback: D,
         mut error_callback: E,
         _timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         // The only config supported end-to-end today is the device native one.
         // Anything else must fail here — passing it through would make soundd
@@ -163,7 +161,7 @@ impl DeviceTrait for Device {
             || config.sample_rate != SAMPLE_RATE
             || sample_format != SampleFormat::I16
         {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(Error::new(ErrorKind::UnsupportedConfig));
         }
 
         let channels = config.channels as usize;
@@ -172,10 +170,11 @@ impl DeviceTrait for Device {
             config.sample_rate as u32,
             config.channels,
             toyos::audio::FORMAT_S16LE,
-        ).map_err(|e| BuildStreamError::BackendSpecific {
-            err: crate::BackendSpecificError {
-                description: format!("failed to open audio stream: {e:?}"),
-            },
+        ).map_err(|e| {
+            Error::with_message(
+                ErrorKind::BackendError,
+                format!("failed to open audio stream: {e:?}"),
+            )
         })?;
 
         assert_eq!(audio.device_sample_rate(), SAMPLE_RATE as u32,
@@ -189,7 +188,7 @@ impl DeviceTrait for Device {
         match config.buffer_size {
             BufferSize::Default => {}
             BufferSize::Fixed(n) if n == buffer_frames => {}
-            BufferSize::Fixed(_) => return Err(BuildStreamError::StreamConfigNotSupported),
+            BufferSize::Fixed(_) => return Err(Error::new(ErrorKind::UnsupportedConfig)),
         }
         let buffer_samples = buffer_frames as usize * channels;
 
@@ -227,7 +226,7 @@ impl DeviceTrait for Device {
                                 frames_delivered += buffer_frames as u64;
                             });
                             if result.is_err() {
-                                error_callback(StreamError::DeviceNotAvailable);
+                                error_callback(Error::new(ErrorKind::DeviceNotAvailable));
                                 break;
                             }
                         }
@@ -237,10 +236,11 @@ impl DeviceTrait for Device {
                 }
                 audio.close();
             })
-            .map_err(|e| BuildStreamError::BackendSpecific {
-                err: crate::BackendSpecificError {
-                    description: format!("failed to spawn audio thread: {e}"),
-                },
+            .map_err(|e| {
+                Error::with_message(
+                    ErrorKind::ResourceExhausted,
+                    format!("failed to spawn audio thread: {e}"),
+                )
             })?;
 
         Ok(Stream {
@@ -253,7 +253,7 @@ impl DeviceTrait for Device {
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), PlayStreamError> {
+    fn play(&self) -> Result<(), Error> {
         self.state.store(STATE_PLAYING, Ordering::Release);
         unsafe {
             toyos_abi::syscall::futex_wake(self.state.as_ptr(), 1);
@@ -261,18 +261,18 @@ impl StreamTrait for Stream {
         Ok(())
     }
 
-    fn pause(&self) -> Result<(), PauseStreamError> {
+    fn pause(&self) -> Result<(), Error> {
         self.state.store(STATE_PAUSED, Ordering::Release);
         Ok(())
     }
 
-    fn buffer_size(&self) -> Result<crate::FrameCount, crate::StreamError> {
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
         Ok(self.buffer_frames)
     }
 
-    fn now(&self) -> crate::StreamInstant {
+    fn now(&self) -> StreamInstant {
         let d = self.creation.elapsed();
-        crate::StreamInstant::new(d.as_secs(), d.subsec_nanos())
+        StreamInstant::new(d.as_secs(), d.subsec_nanos())
     }
 }
 
