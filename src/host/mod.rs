@@ -123,6 +123,7 @@ pub(crate) type ErrorCallbackArc = std::sync::Arc<std::sync::Mutex<dyn FnMut(cra
     target_os = "android",
     target_vendor = "apple",
     target_os = "windows",
+    target_os = "toyos",
     all(
         feature = "jack",
         any(
@@ -159,6 +160,7 @@ pub(crate) mod error_emit;
     target_os = "android",
     target_vendor = "apple",
     target_os = "windows",
+    target_os = "toyos",
     all(
         feature = "jack",
         any(

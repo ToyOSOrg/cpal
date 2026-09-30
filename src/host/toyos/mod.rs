@@ -1,8 +1,11 @@
+use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::host::{emit_error, ErrorCallbackArc};
 use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::{
     BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error, ErrorKind,
@@ -17,6 +20,17 @@ const SAMPLE_RATE: SampleRate = 44100;
 // soundd's fixed device period — the only buffer size a stream can get, so
 // it is also the only size advertised (advertised configs must build).
 const PERIOD_FRAMES: crate::FrameCount = 128;
+
+// How long soundd may take to let go of a closed stream. It fades the stream
+// out over 5 ms of frames (`toyos_mixer::ramp_frames`), mixed a period at a
+// time as the device hands periods back, and a mix loop that has not run for
+// the 8 periods of the stream's ring has let the device play out everything it
+// was given: past the fade and one ring, soundd is not serving the stream.
+const FADE_FRAMES: u32 = SAMPLE_RATE * 5 / 1000;
+const RING_PERIODS: u32 = 8;
+const RELEASE_FRAMES: u32 = (FADE_FRAMES.div_ceil(PERIOD_FRAMES) + RING_PERIODS) * PERIOD_FRAMES;
+const RELEASE_WITHIN: Duration =
+    Duration::from_nanos(RELEASE_FRAMES as u64 * 1_000_000_000 / SAMPLE_RATE as u64);
 
 // Stream-thread state machine, also the futex word the paused thread parks on.
 const STATE_PAUSED: u32 = 0;
@@ -37,6 +51,11 @@ impl fmt::Display for Device {
 pub struct Stream {
     state: Arc<AtomicU32>,
     thread: Option<std::thread::JoinHandle<()>>,
+    // Never sent on: the stream thread holds the sender, so its end, however
+    // it ends, is the disconnect `Drop` waits for. Locked by nothing; the
+    // mutex makes the receiver `Sync`.
+    ended: Mutex<mpsc::Receiver<Infallible>>,
+    error_callback: ErrorCallbackArc,
     creation: std::time::Instant,
     buffer_frames: u32,
 }
@@ -146,7 +165,7 @@ impl DeviceTrait for Device {
         config: StreamConfig,
         sample_format: SampleFormat,
         mut data_callback: D,
-        mut error_callback: E,
+        error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, Error>
     where
@@ -194,10 +213,14 @@ impl DeviceTrait for Device {
 
         let state = Arc::new(AtomicU32::new(STATE_PAUSED));
         let state2 = state.clone();
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
+        let error_callback2 = error_callback.clone();
+        let (ended_tx, ended) = mpsc::channel();
 
         let thread = std::thread::Builder::new()
             .name("cpal-toyos-audio".to_string())
             .spawn(move || {
+                let _ended = ended_tx;
                 let mut frames_delivered: u64 = 0;
                 loop {
                     match state2.load(Ordering::Acquire) {
@@ -208,6 +231,13 @@ impl DeviceTrait for Device {
                         },
                         STATE_PLAYING => {
                             let result = audio.wait_and_fill(|buf| {
+                                // Dropped while this wait blocked: `Drop` may
+                                // already have returned, so the data callback
+                                // is not called again.
+                                if state2.load(Ordering::Acquire) == STATE_DEAD {
+                                    buf.fill(0);
+                                    return;
+                                }
                                 let now = StreamInstant::from_nanos(
                                     frames_delivered * 1_000_000_000 / SAMPLE_RATE as u64,
                                 );
@@ -226,7 +256,10 @@ impl DeviceTrait for Device {
                                 frames_delivered += buffer_frames as u64;
                             });
                             if result.is_err() {
-                                error_callback(Error::new(ErrorKind::DeviceNotAvailable));
+                                emit_error(
+                                    &error_callback2,
+                                    Error::new(ErrorKind::DeviceNotAvailable),
+                                );
                                 break;
                             }
                         }
@@ -235,10 +268,9 @@ impl DeviceTrait for Device {
                     }
                 }
                 audio.close();
-                // soundd fades a closed stream out of its mix before it lets go
-                // of it, and closes the signal pipe when it does: this thread,
-                // and the `Drop` that joins it, end only then. What soundd asks
-                // for meanwhile is past the stream's end.
+                // soundd closes the signal pipe once it has faded the stream
+                // out of its mix, and this thread's end is what `Drop` waits
+                // for. What soundd asks for until then is past the stream's end.
                 while audio.wait_and_fill(|period| period.fill(0)).is_ok() {}
             })
             .map_err(|e| {
@@ -251,6 +283,8 @@ impl DeviceTrait for Device {
         Ok(Stream {
             state,
             thread: Some(thread),
+            ended: Mutex::new(ended),
+            error_callback,
             creation: std::time::Instant::now(),
             buffer_frames,
         })
@@ -287,8 +321,26 @@ impl Drop for Stream {
         unsafe {
             toyos_abi::syscall::futex_wake(self.state.as_ptr(), 1);
         }
-        if let Some(th) = self.thread.take() {
-            let _ = th.join();
+        let ended = self.ended.get_mut().unwrap_or_else(|e| e.into_inner());
+        match ended.recv_timeout(RELEASE_WITHIN) {
+            Ok(never) => match never {},
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(th) = self.thread.take() {
+                    let _ = th.join();
+                }
+            }
+            // The stream thread is left to soundd: it ends when soundd lets
+            // go of the stream, or with the process.
+            Err(RecvTimeoutError::Timeout) => emit_error(
+                &self.error_callback,
+                Error::with_message(
+                    ErrorKind::HostUnavailable,
+                    format!(
+                        "soundd did not let go of the closed stream within {RELEASE_WITHIN:?}, \
+                         its fade and a ring of periods"
+                    ),
+                ),
+            ),
         }
     }
 }
