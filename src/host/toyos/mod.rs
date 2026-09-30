@@ -235,6 +235,11 @@ impl DeviceTrait for Device {
                     }
                 }
                 audio.close();
+                // soundd fades a closed stream out of its mix before it lets go
+                // of it, and closes the signal pipe when it does: this thread,
+                // and the `Drop` that joins it, end only then. What soundd asks
+                // for meanwhile is past the stream's end.
+                while audio.wait_and_fill(|period| period.fill(0)).is_ok() {}
             })
             .map_err(|e| {
                 Error::with_message(
