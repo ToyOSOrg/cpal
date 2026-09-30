@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::host::{emit_error, ErrorCallbackArc};
@@ -25,7 +25,7 @@ const PERIOD_FRAMES: crate::FrameCount = 128;
 // out over 5 ms of frames (`toyos_mixer::ramp_frames`), mixed a period at a
 // time as the device hands periods back, and a mix loop that has not run for
 // the 8 periods of the stream's ring has let the device play out everything it
-// was given: past the fade and one ring, soundd is not serving the stream.
+// was given.
 const FADE_FRAMES: u32 = SAMPLE_RATE * 5 / 1000;
 const RING_PERIODS: u32 = 8;
 const RELEASE_FRAMES: u32 = (FADE_FRAMES.div_ceil(PERIOD_FRAMES) + RING_PERIODS) * PERIOD_FRAMES;
@@ -36,6 +36,8 @@ const RELEASE_WITHIN: Duration =
 const STATE_PAUSED: u32 = 0;
 const STATE_PLAYING: u32 = 1;
 const STATE_DEAD: u32 = 2;
+
+type DataCallback = Box<dyn FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static>;
 
 pub struct Host;
 
@@ -55,6 +57,9 @@ pub struct Stream {
     // it ends, is the disconnect `Drop` waits for. Locked by nothing; the
     // mutex makes the receiver `Sync`.
     ended: Mutex<mpsc::Receiver<Infallible>>,
+    // Taken by a `Drop` that gives up on soundd. A fill calls it under this
+    // lock, so it is not called once `Drop` has returned.
+    data_callback: Arc<Mutex<Option<DataCallback>>>,
     error_callback: ErrorCallbackArc,
     creation: std::time::Instant,
     buffer_frames: u32,
@@ -164,7 +169,7 @@ impl DeviceTrait for Device {
         &self,
         config: StreamConfig,
         sample_format: SampleFormat,
-        mut data_callback: D,
+        data_callback: D,
         error_callback: E,
         _timeout: Option<Duration>,
     ) -> Result<Self::Stream, Error>
@@ -213,6 +218,9 @@ impl DeviceTrait for Device {
 
         let state = Arc::new(AtomicU32::new(STATE_PAUSED));
         let state2 = state.clone();
+        let data_callback: Arc<Mutex<Option<DataCallback>>> =
+            Arc::new(Mutex::new(Some(Box::new(data_callback))));
+        let data_callback2 = data_callback.clone();
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
         let error_callback2 = error_callback.clone();
         let (ended_tx, ended) = mpsc::channel();
@@ -231,13 +239,13 @@ impl DeviceTrait for Device {
                         },
                         STATE_PLAYING => {
                             let result = audio.wait_and_fill(|buf| {
-                                // Dropped while this wait blocked: `Drop` may
-                                // already have returned, so the data callback
-                                // is not called again.
-                                if state2.load(Ordering::Acquire) == STATE_DEAD {
+                                let mut app = data_callback2
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
+                                let Some(data_callback) = app.as_mut() else {
                                     buf.fill(0);
                                     return;
-                                }
+                                };
                                 let now = StreamInstant::from_nanos(
                                     frames_delivered * 1_000_000_000 / SAMPLE_RATE as u64,
                                 );
@@ -256,10 +264,16 @@ impl DeviceTrait for Device {
                                 frames_delivered += buffer_frames as u64;
                             });
                             if result.is_err() {
-                                emit_error(
-                                    &error_callback2,
-                                    Error::new(ErrorKind::DeviceNotAvailable),
-                                );
+                                // A dropped stream reports nothing more. Read
+                                // under the lock a `Drop` that gives up takes
+                                // after storing `STATE_DEAD`, so no report
+                                // lands once `Drop` has returned.
+                                let mut error_callback = error_callback2
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner);
+                                if state2.load(Ordering::Acquire) != STATE_DEAD {
+                                    (*error_callback)(Error::new(ErrorKind::DeviceNotAvailable));
+                                }
                                 break;
                             }
                         }
@@ -271,7 +285,15 @@ impl DeviceTrait for Device {
                 // soundd closes the signal pipe once it has faded the stream
                 // out of its mix, and this thread's end is what `Drop` waits
                 // for. What soundd asks for until then is past the stream's end.
-                while audio.wait_and_fill(|period| period.fill(0)).is_ok() {}
+                // Once `Drop` has given up, the thread ends at soundd's next
+                // signal instead, and the stream's end lets soundd remove it.
+                let given_up = || {
+                    data_callback2
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_none()
+                };
+                while !given_up() && audio.wait_and_fill(|period| period.fill(0)).is_ok() {}
             })
             .map_err(|e| {
                 Error::with_message(
@@ -284,6 +306,7 @@ impl DeviceTrait for Device {
             state,
             thread: Some(thread),
             ended: Mutex::new(ended),
+            data_callback,
             error_callback,
             creation: std::time::Instant::now(),
             buffer_frames,
@@ -329,18 +352,22 @@ impl Drop for Stream {
                     let _ = th.join();
                 }
             }
-            // The stream thread is left to soundd: it ends when soundd lets
-            // go of the stream, or with the process.
-            Err(RecvTimeoutError::Timeout) => emit_error(
-                &self.error_callback,
-                Error::with_message(
-                    ErrorKind::HostUnavailable,
-                    format!(
-                        "soundd did not let go of the closed stream within {RELEASE_WITHIN:?}, \
-                         its fade and a ring of periods"
+            Err(RecvTimeoutError::Timeout) => {
+                self.data_callback
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                emit_error(
+                    &self.error_callback,
+                    Error::with_message(
+                        ErrorKind::HostUnavailable,
+                        format!(
+                            "soundd did not let go of the closed stream within \
+                             {RELEASE_WITHIN:?}, its fade and a ring of periods"
+                        ),
                     ),
-                ),
-            ),
+                );
+            }
         }
     }
 }
