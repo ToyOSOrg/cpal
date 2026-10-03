@@ -17,11 +17,11 @@ use crate::{
 const DEVICE_NAME: &str = "ToyOS Audio";
 const CHANNELS: u16 = 2;
 const SAMPLE_RATE: SampleRate = 44100;
-// soundd's fixed device period — the only buffer size a stream can get, so
+// soundserver's fixed device period — the only buffer size a stream can get, so
 // it is also the only size advertised (advertised configs must build).
 const PERIOD_FRAMES: crate::FrameCount = 128;
 
-// How long soundd may take to let go of a closed stream. It fades the stream
+// How long soundserver may take to let go of a closed stream. It fades the stream
 // out over 5 ms of frames (`toyos_mixer::ramp_frames`), mixed a period at a
 // time as the device hands periods back, and a mix loop that has not run for
 // the 8 periods of the stream's ring has let the device play out everything it
@@ -57,7 +57,7 @@ pub struct Stream {
     // it ends, is the disconnect `Drop` waits for. Locked by nothing; the
     // mutex makes the receiver `Sync`.
     ended: Mutex<mpsc::Receiver<Infallible>>,
-    // Taken by a `Drop` that gives up on soundd. A fill calls it under this
+    // Taken by a `Drop` that gives up on soundserver. A fill calls it under this
     // lock, so it is not called once `Drop` has returned.
     data_callback: Arc<Mutex<Option<DataCallback>>>,
     error_callback: ErrorCallbackArc,
@@ -178,7 +178,7 @@ impl DeviceTrait for Device {
         E: FnMut(Error) + Send + 'static,
     {
         // The only config supported end-to-end today is the device native one.
-        // Anything else must fail here — passing it through would make soundd
+        // Anything else must fail here — passing it through would make soundserver
         // misinterpret the slot contents (e.g. f32 written into i16-sized
         // slots overruns them 2x).
         if config.channels != CHANNELS
@@ -202,11 +202,11 @@ impl DeviceTrait for Device {
         })?;
 
         assert_eq!(audio.device_sample_rate(), SAMPLE_RATE as u32,
-            "soundd device sample rate diverged from advertised config");
+            "soundserver device sample rate diverged from advertised config");
         assert_eq!(audio.device_channels(), CHANNELS,
-            "soundd device channel count diverged from advertised config");
+            "soundserver device channel count diverged from advertised config");
         assert_eq!(audio.period_frames(), PERIOD_FRAMES,
-            "soundd client period diverged from advertised buffer size");
+            "soundserver client period diverged from advertised buffer size");
 
         let buffer_frames = audio.period_frames();
         match config.buffer_size {
@@ -282,11 +282,11 @@ impl DeviceTrait for Device {
                     }
                 }
                 audio.close();
-                // soundd closes the signal pipe once it has faded the stream
+                // soundserver closes the signal pipe once it has faded the stream
                 // out of its mix, and this thread's end is what `Drop` waits
-                // for. What soundd asks for until then is past the stream's end.
-                // Once `Drop` has given up, the thread ends at soundd's next
-                // signal instead, and the stream's end lets soundd remove it.
+                // for. What soundserver asks for until then is past the stream's end.
+                // Once `Drop` has given up, the thread ends at soundserver's next
+                // signal instead, and the stream's end lets soundserver remove it.
                 let given_up = || {
                     data_callback2
                         .lock()
@@ -362,7 +362,7 @@ impl Drop for Stream {
                     Error::with_message(
                         ErrorKind::HostUnavailable,
                         format!(
-                            "soundd did not let go of the closed stream within \
+                            "soundserver did not let go of the closed stream within \
                              {RELEASE_WITHIN:?}, its fade and a ring of periods"
                         ),
                     ),
